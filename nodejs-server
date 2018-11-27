@@ -1,0 +1,153 @@
+var express = require('express');
+var socket = require('socket.io');
+var grpc = require('grpc');
+var fs = require('fs');
+
+process.env.GRPC_SSL_CIPHER_SUITES = 'HIGH+ECDSA'
+
+//find macaroon
+var m = fs.readFileSync('/path/to/admin.macaroon');
+var macaroon = m.toString('hex');
+
+//build meta data credentials
+var metadata = new grpc.Metadata()
+metadata.add('macaroon', macaroon)
+var macaroonCreds = grpc.credentials.createFromMetadataGenerator((_args, callback) => {
+  callback(null, metadata);
+});
+
+//build ssl credentials using the cert the same as before
+var lndCert = fs.readFileSync("/path/to/tls.cert");
+var sslCreds = grpc.credentials.createSsl(lndCert);
+
+//combine the cert credentials and the macaroon auth credentials
+//such that every call is properly encrypted and authenticated
+var credentials = grpc.credentials.combineChannelCredentials(sslCreds, macaroonCreds);
+
+//pass the crendentials when creating a channel
+var lnrpcDescriptor = grpc.load("/path/to/rpc.proto");
+var lnrpc = lnrpcDescriptor.lnrpc;
+var client = new lnrpc.Lightning('localhost:0000', credentials);
+var walletUnlocker = new lnrpc.WalletUnlocker('localhost:0000', credentials);
+
+//object to pass to lnd daemon to request wallt unlock
+var requestUnlock = {
+    wallet_password:"password",
+    recovery_window:0
+};
+
+//attempt to unlock wallet if lnd is up and waiting, loop until lnd is up and waiting
+(function UnlockLoop() {
+    walletUnlocker.UnlockWallet(requestUnlock, function(err, response) {
+        console.log("requested unlock");
+        if (response == undefined){
+            console.log("no unlock, try in 60 seconds: " + response);
+        }
+        else if (response !== undefined){
+            clearTimeout(unlockTimeout);
+            console.log("unlocked, timeout cleared: " + response);
+        }
+    var unlockTimeout = setTimeout(UnlockLoop, 10000);
+    })
+})();
+
+//setup listening port on server
+var app = express();
+var server = app.listen(3000, function(){
+    console.log("listening for requests on port 3000");
+});
+
+//format request, only 2 fields are needed, expiry defaults to 1 hour
+var request = { 
+    memo: "Pacman credit", 
+    //receipt: <bytes>, 
+    //r_preimage: <bytes>, 
+    //r_hash: <bytes>, 
+    value: 1000, 
+    //settled: <bool>, 
+    //creation_date: <int64>, 
+    //settle_date: <int64>, 
+    //payment_request: <string>, 
+    //description_hash: <bytes>, 
+    //expiry: <int64>, 
+    //fallback_addr: <string>, 
+    //cltv_expiry: <uint64>, 
+    //route_hints: <array RouteHint>, 
+    //private: <bool>, 
+    //add_index: <uint64>, 
+    //settle_index: <uint64>, 
+    //amt_paid: <int64>, 
+    //amt_paid_sat: <int64>, 
+    //amt_paid_msat: <int64>, 
+  }
+
+//object that keeps track of sockets, associated payment code, associated credit amount
+//this could become unwieldly depending on amount of users, if so replace redis or db
+var sockInvCredStore = {};
+
+//have LND generate new payment code (invoice) and pass to client
+function RefreshPaymentCode(socketId){
+    client.addInvoice(request, function(err, response){
+        sockInvCredStore[socketId][0] = [response.payment_request];
+        io.to(socketId).emit('NewPaymentCodeResponse', String(response.payment_request));
+    });
+}
+
+//connection made with client
+var io = socket(server);
+io.on('connection', function(socket){
+    console.log("made socket connection", socket.id);
+    
+    //store socket id in sockInvCredStore, init blank invoice, no credit 
+    sockInvCredStore[socket.id] = ["", 0];
+
+    //send initial credit amount (0) to client
+    socket.emit('creditValue', sockInvCredStore[socket.id][1]);
+
+    //call function to refresh QR code on client, then refresh hourly
+    RefreshPaymentCode(socket.id);
+    //setInterval(RefreshPaymentCode(socket.id), 3600000);
+
+    //on disconnect of socket, delete that id from sockInvCredStore
+    socket.on('disconnect', function() {
+        delete sockInvCredStore[socket.id];
+    });
+
+//check if server-side credit > 0, if so update server-side credit
+//send server-side credit back to client to update its canvas and start
+//game. Else just correct client.
+    socket.on('CreditCheck', function(){
+        if (sockInvCredStore[socket.id][1] > 0){
+            io.to(socket.id).emit("CreditCheckTrue");
+            sockInvCredStore[socket.id][1] -= 1;
+            io.to(socket.id).emit('creditValueOnStartPress', sockInvCredStore[socket.id][1]);
+
+            }
+        else {
+            io.to(socket.id).emit('creditValueOnStartPress', sockInvCredStore[socket.id][1]);
+            };
+    });
+
+});
+
+//check LND daemon rpc if payment code (invoice) has been paid
+//if paid, update server-side credit and pass to client-side credit
+//lastly, get new payment code and send to client for QR display
+var call = client.subscribeInvoices({});
+call.on('data', function(invoice) {
+
+   for (var key in sockInvCredStore){
+       if (sockInvCredStore[key][0] == invoice.payment_request && invoice.settled == true){
+            sockInvCredStore[key][1] += 1;
+            io.to(key).emit("creditValue", sockInvCredStore[key][1]);
+            RefreshPaymentCode(key);
+       }
+   }
+})
+.on('end', function() {
+    // The server has finished sending
+})
+.on('status', function(status) {
+    // Process status
+    //console.log("Current status" + status);
+});
